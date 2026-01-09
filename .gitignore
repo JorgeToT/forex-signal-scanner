@@ -11,6 +11,10 @@ venv/
 # CSV signals (generated data)
 signals_*.csv
 
+# Trade tracking data (personal)
+trades.json
+last_signals.json
+
 # IDE
 .vscode/
 .idea/

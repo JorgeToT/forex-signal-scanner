@@ -2003,6 +2003,15 @@ def run_single_scan(
     # Info de sesión
     print(build_session_info())
     
+    # Mostrar trades abiertos (si hay)
+    try:
+        from trades import list_open_trades, load_trades, save_last_signals
+        trades_data = load_trades()
+        if trades_data.get("open"):
+            list_open_trades(show_alerts=True)
+    except ImportError:
+        pass
+    
     # Escaneo
     results = scan_market(
         tickers=FOREX_UNIVERSE,
@@ -2014,6 +2023,26 @@ def run_single_scan(
         filter_by_session=filter_by_session,
         filter_adr_exhausted=filter_adr
     )
+    
+    # Guardar señales para el sistema de tracking
+    try:
+        from trades import save_last_signals
+        # Preparar señales serializables
+        signals_to_save = []
+        for r in results:
+            sig = {
+                "ticker": r.get("ticker"),
+                "summary": r.get("summary"),
+                "risk": r.get("risk"),
+                "position": r.get("position"),
+                "quality": r.get("quality"),
+                "spread_adjustment": r.get("spread_adjustment"),
+                "final_confidence": r.get("final_confidence"),
+            }
+            signals_to_save.append(sig)
+        save_last_signals(signals_to_save)
+    except ImportError:
+        pass
     
     # Ranking
     print(build_ranking_summary(results, top_n=top_n))
@@ -2048,6 +2077,12 @@ def run_single_scan(
                 score = sig.get("quality", {}).get("score", 0)
                 print(f"   🅰️ {tkr} - {action} (Score: {score})")
             play_alert_sound("grade_a")
+    
+    # Recordatorio de comandos de trades
+    print(f"\n{'─' * 50}")
+    print(f"  💡 Para abrir trade: python trades.py --open N")
+    print(f"  💡 Para ver trades:  python trades.py --list")
+    print(f"{'─' * 50}")
     
     return results
 
