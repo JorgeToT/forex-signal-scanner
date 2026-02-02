@@ -186,7 +186,8 @@ def open_trade(signal_num: int) -> bool:
     quality = signal.get("quality", {})
     spread_adj = signal.get("spread_adjustment", {})
     
-    entry = risk.get("entry", 0)
+    entry_mid = risk.get("entry_mid", risk.get("entry", 0))
+    entry = spread_adj.get("entry_adjusted", entry_mid)
     sl = spread_adj.get("sl_adjusted", risk.get("sl", 0))
     tp = spread_adj.get("tp_adjusted", risk.get("tp", 0))
     lots = position.get("lots", 0)
@@ -202,6 +203,7 @@ def open_trade(signal_num: int) -> bool:
         "symbol": ticker.replace("=X", ""),
         "action": action,
         "entry": entry,
+        "entry_mid": entry_mid,
         "sl": sl,
         "tp": tp,
         "sl_original": risk.get("sl", 0),
@@ -228,7 +230,8 @@ def open_trade(signal_num: int) -> bool:
     print(f"{'═' * 60}")
     print(f"  Par: {trade['symbol']}")
     print(f"  Acción: {'🟢 BUY' if action == 'BUY' else '🔴 SELL'}")
-    print(f"  Entry: {entry:.{decimals}f}")
+    print(f"  Entry (mid): {entry_mid:.{decimals}f}")
+    print(f"  Entry (con spread): {entry:.{decimals}f}")
     print(f"  SL: {sl:.{decimals}f} (ajustado por spread)")
     print(f"  TP: {tp:.{decimals}f} (ajustado por spread)")
     print(f"  Lotes: {lots:.2f}")
@@ -531,7 +534,10 @@ Ejemplos:
                 symbol = sig.get("ticker", "").replace("=X", "")
                 action = sig.get("summary", {}).get("action", "")
                 grade = sig.get("quality", {}).get("grade", "?")
-                entry = sig.get("risk", {}).get("entry", 0)
+                spread_adj = sig.get("spread_adjustment", {})
+                risk = sig.get("risk", {})
+                entry_mid = risk.get("entry_mid", risk.get("entry", 0))
+                entry = spread_adj.get("entry_adjusted", entry_mid)
                 decimals = 3 if "JPY" in symbol else 5
                 print(f"  {i}. {symbol} {action} @ {entry:.{decimals}f} (Grado {grade})")
             print()

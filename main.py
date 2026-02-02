@@ -31,6 +31,21 @@ import yfinance as yf
 
 
 # ----------------------------
+# Global settings
+# ----------------------------
+# Use last confirmed candle to avoid repainting/incomplete data
+USE_CONFIRMED_CANDLES = True
+
+# Cache OHLC downloads during a scan to keep data consistent and faster
+USE_OHLC_CACHE = True
+
+# Entry adjustment uses half-spread (0.5 = half, 1.0 = full)
+SPREAD_ENTRY_FACTOR = 0.5
+
+# In-memory cache for OHLC data (cleared each scan)
+_OHLC_CACHE: Dict[Tuple[str, str, str], pd.DataFrame] = {}
+
+# ----------------------------
 # Indicators
 # ----------------------------
 def ema(series: pd.Series, span: int) -> pd.Series:
@@ -138,32 +153,47 @@ def adjust_sl_tp_for_spread(
     Retorna:
     - sl_adjusted: SL ajustado por spread
     - tp_adjusted: TP ajustado por spread
+    - entry_adjusted: Entry ajustado por spread (ask/bid)
     - sl_pips_added: Pips agregados al SL
     - tp_pips_added: Pips agregados al TP
     """
     spread_info = get_spread_adjustment(ticker)
     spread = spread_info["spread_price"] * buffer_multiplier
     pip = spread_info["pip"]
+    half_spread = spread * SPREAD_ENTRY_FACTOR
     
     if action == "BUY":
         # BUY: SL se activa cuando BID cae → mover SL más abajo
         # TP se activa cuando BID sube → mover TP más arriba
+        entry_adjusted = entry + half_spread
         sl_adjusted = sl - spread
         tp_adjusted = tp + spread
     elif action == "SELL":
         # SELL: SL se activa cuando ASK sube → mover SL más arriba
         # TP se activa cuando ASK baja → mover TP más abajo
+        entry_adjusted = entry - half_spread
         sl_adjusted = sl + spread
         tp_adjusted = tp - spread
     else:
-        return {"sl_adjusted": sl, "tp_adjusted": tp, "spread_pips": 0}
+        return {
+            "entry_mid": entry,
+            "entry_adjusted": entry,
+            "sl_adjusted": sl,
+            "tp_adjusted": tp,
+            "spread_pips": 0,
+            "spread_price": 0.0
+        }
     
     return {
+        "entry_mid": entry,
+        "entry_adjusted": entry_adjusted,
         "sl_original": sl,
         "tp_original": tp,
         "sl_adjusted": sl_adjusted,
         "tp_adjusted": tp_adjusted,
         "spread_pips": spread_info["spread_pips"],
+        "spread_price": spread,
+        "entry_buffer_pips": round(half_spread / pip, 1),
         "sl_buffer_pips": round(spread / pip, 1),
         "tp_buffer_pips": round(spread / pip, 1),
         "description": f"📊 Spread ~{spread_info['spread_pips']:.1f} pips → SL/TP ajustados"
@@ -272,19 +302,10 @@ def calculate_adr(ticker: str, period: int = 14) -> Dict[str, object]:
     - exhausted: True si hoy ya se movió >70% del ADR
     """
     try:
-        # Obtener datos diarios
-        df = yf.download(
-            tickers=ticker,
-            period=f"{period + 5}d",
-            interval="1d",
-            auto_adjust=False,
-            progress=False
-        )
-        
+        # Obtener datos diarios (cacheados)
+        df = fetch_ohlc(ticker, interval="1d", lookback=f"{period + 5}d")
         if df is None or len(df) < period:
             return {"adr": None, "exhausted": False, "description": "Datos insuficientes"}
-        
-        df = _normalize_yfinance_columns(df)
         
         # Calcular ADR (promedio del rango diario)
         df["Range"] = df["High"] - df["Low"]
@@ -355,19 +376,10 @@ def detect_liquidity_zones(
     - description: Resumen
     """
     try:
-        # Obtener datos
-        df = yf.download(
-            tickers=ticker,
-            period="60d",
-            interval=timeframe,
-            auto_adjust=False,
-            progress=False
-        )
-        
+        # Obtener datos (cacheados)
+        df = fetch_ohlc(ticker, interval=timeframe, lookback="60d")
         if df is None or len(df) < lookback_bars:
             return {"description": "Datos insuficientes para detectar liquidez"}
-        
-        df = _normalize_yfinance_columns(df)
         df = df.iloc[-lookback_bars:]
         
         highs = df["High"].values
@@ -509,9 +521,10 @@ def calculate_quality_score(signal: dict) -> Dict[str, object]:
     
     # 2. Ratio R:R (20 puntos máx)
     rk = signal.get("risk", {})
-    entry = rk.get("entry", 0)
-    sl = rk.get("sl", 0)
-    tp = rk.get("tp", 0)
+    spread_adj = signal.get("spread_adjustment", {})
+    entry = spread_adj.get("entry_adjusted", rk.get("entry", 0))
+    sl = spread_adj.get("sl_adjusted", rk.get("sl", 0))
+    tp = spread_adj.get("tp_adjusted", rk.get("tp", 0))
     
     if entry and sl and tp:
         sl_dist = abs(entry - sl)
@@ -629,6 +642,22 @@ def calculate_quality_score(signal: dict) -> Dict[str, object]:
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
+def clear_ohlc_cache():
+    """Limpia el cache de OHLC entre escaneos."""
+    _OHLC_CACHE.clear()
+
+def _select_candle_index(df: pd.DataFrame, use_confirmed: bool = True):
+    """
+    Selecciona la vela a usar para señales.
+    - use_confirmed=True: usa la vela previa (confirmada) si existe.
+    - use_confirmed=False: usa la última vela disponible.
+    """
+    if df is None or df.empty:
+        raise ValueError("DataFrame vacío al seleccionar vela.")
+    if use_confirmed and len(df) >= 2:
+        return df.index[-2]
+    return df.index[-1]
+
 def _normalize_yfinance_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Flatten yfinance MultiIndex columns (if any) and ensure OHLC exists."""
     if df is None or df.empty:
@@ -643,6 +672,10 @@ def _normalize_yfinance_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def fetch_ohlc(ticker: str, interval: str, lookback: str) -> pd.DataFrame:
+    cache_key = (ticker, interval, lookback)
+    if USE_OHLC_CACHE and cache_key in _OHLC_CACHE:
+        return _OHLC_CACHE[cache_key].copy()
+
     df = yf.download(
         tickers=ticker,
         period=lookback,
@@ -655,6 +688,10 @@ def fetch_ohlc(ticker: str, interval: str, lookback: str) -> pd.DataFrame:
     df = df.dropna()
     if df.empty:
         raise ValueError(f"No se pudieron obtener datos para {ticker} con intervalo {interval}.")
+
+    if USE_OHLC_CACHE:
+        _OHLC_CACHE[cache_key] = df.copy()
+
     return df
 
 
@@ -857,7 +894,7 @@ TF_MAP = {
     "30m": TFConfig(interval="30m", lookback="30d",  weight=0.2),
 }
 
-def score_timeframe(df: pd.DataFrame) -> Dict[str, float]:
+def score_timeframe(df: pd.DataFrame, use_confirmed: bool = USE_CONFIRMED_CANDLES) -> Dict[str, float]:
     close = df["Close"]
     high = df["High"]
     low = df["Low"]
@@ -868,7 +905,7 @@ def score_timeframe(df: pd.DataFrame) -> Dict[str, float]:
     _, _, hist = macd(close)
     a = atr(high, low, close, 14)
 
-    last = df.index[-1]
+    last = _select_candle_index(df, use_confirmed=use_confirmed)
     trend_up = float(ema_fast.loc[last] > ema_slow.loc[last])
     trend_dn = float(ema_fast.loc[last] < ema_slow.loc[last])
 
@@ -879,8 +916,14 @@ def score_timeframe(df: pd.DataFrame) -> Dict[str, float]:
 
     atr_pct = (atr_val / close_val) * 100.0
 
-    # Detectar divergencias RSI
-    divergence = detect_divergence(close, r, lookback=25)
+    # Detectar divergencias RSI (opcionalmente sin la última vela)
+    if use_confirmed and len(close) > 2:
+        div_close = close.iloc[:-1]
+        div_rsi = r.iloc[:-1]
+    else:
+        div_close = close
+        div_rsi = r
+    divergence = detect_divergence(div_close, div_rsi, lookback=25)
 
     score = 0.0
     if trend_up:
@@ -911,6 +954,20 @@ def score_timeframe(df: pd.DataFrame) -> Dict[str, float]:
         divergence_impact = divergence["strength"] * 0.25
         score -= divergence_impact
 
+    # Penalizar señales en extremos (evita perseguir sobrecompra/sobreventa)
+    if rsi_val > 80 and score > 0:
+        score -= 0.10
+    elif rsi_val < 20 and score < 0:
+        score += 0.10
+
+    # Ajuste por fuerza de tendencia (EMA spread vs ATR)
+    ema_spread = abs(float(ema_fast.loc[last] - ema_slow.loc[last]))
+    trend_strength = ema_spread / (atr_val if atr_val else 1e-9)
+    if trend_strength < 0.5:
+        score *= 0.85
+    elif trend_strength > 1.5:
+        score *= 1.05
+
     vol_penalty = 0.20 if atr_pct < 0.08 else 0.0
 
     score = clamp(score, -1.0, 1.0)
@@ -929,7 +986,9 @@ def score_timeframe(df: pd.DataFrame) -> Dict[str, float]:
         "macd_hist": hist_val,
         "atr_pct": atr_pct,
         "atr": atr_val,
-        "divergence": divergence
+        "divergence": divergence,
+        "trend_strength": round(trend_strength, 2),
+        "timestamp": str(last)
     }
 
 def aggregate_signal(tf_results: Dict[str, Dict[str, float]]) -> Dict[str, object]:
@@ -952,9 +1011,21 @@ def aggregate_signal(tf_results: Dict[str, Dict[str, float]]) -> Dict[str, objec
 
 def compute_final_confidence(weighted_score: float, agreement: bool, tf_results: dict) -> float:
     base = abs(weighted_score)
-    bonus = 0.10 if agreement else 0.0
+    bonus = 0.08 if agreement else 0.0
+    # Penalizar si pocos timeframes apoyan la dirección
+    if tf_results:
+        aligned = sum(1 for tf in tf_results if tf_results[tf].get("score", 0) * weighted_score > 0)
+        alignment_ratio = aligned / max(len(tf_results), 1)
+    else:
+        alignment_ratio = 0.0
     atr30 = tf_results.get("30m", {}).get("atr_pct", 0.0)
     penalty = 0.15 if atr30 < 0.06 else 0.0
+    if alignment_ratio < 0.67:
+        penalty += 0.10
+    # Penalización extra si 4H va en contra
+    score_4h = tf_results.get("4H", {}).get("score", 0.0)
+    if score_4h * weighted_score < 0:
+        penalty += 0.08
     return clamp(base + bonus - penalty, 0.0, 1.0)
 
 def compute_sl_tp_atr(action: str, entry: float, atr_value: float, rr: float = 2.0, atr_mult_sl: float = 1.5) -> dict:
@@ -1136,25 +1207,30 @@ def build_trade_summary(out: dict) -> str:
 
     # Plan de trade
     if action != "HOLD" and rk.get("sl") is not None and rk.get("tp") is not None:
+        spread_adj = out.get("spread_adjustment", {})
         entry = rk.get("entry", 0)
+        entry_mid = rk.get("entry_mid", entry)
         sl = rk.get("sl", 0)
         tp = rk.get("tp", 0)
+        entry_adj = spread_adj.get("entry_adjusted", entry_mid)
+        sl_adj = spread_adj.get("sl_adjusted", sl)
+        tp_adj = spread_adj.get("tp_adjusted", tp)
         sl_tag = rk.get("sl_tag", "ATR")
         tp_tag = rk.get("tp_tag", "ATR")
         
-        # Calcular R:R real
-        sl_dist = abs(entry - sl)
-        tp_dist = abs(entry - tp)
-        rr_ratio = tp_dist / sl_dist if sl_dist > 0 else 0
+        # Calcular R:R real usando niveles ajustados
+        rr_ratio = calculate_rr_ratio(entry_adj, sl_adj, tp_adj)
+        decimals = 3 if "JPY" in tkr else 5
 
         lines.extend([
             "",
             f"{'─' * 50}",
             "✅ Plan de trade",
             f"{'─' * 50}",
-            f"  • Entrada: {entry:.5f}",
-            f"  • Stop Loss: {sl:.5f} ({sl_tag})",
-            f"  • Take Profit: {tp:.5f} ({tp_tag})",
+            f"  • Entrada (mid): {entry_mid:.{decimals}f}",
+            f"  • Entrada (con spread): {entry_adj:.{decimals}f}",
+            f"  • Stop Loss: {sl_adj:.{decimals}f} ({sl_tag})",
+            f"  • Take Profit: {tp_adj:.{decimals}f} ({tp_tag})",
             f"  • R:R: ~1:{rr_ratio:.1f}",
         ])
 
@@ -1230,7 +1306,8 @@ def get_signal(
     fib_timeframe: str = "4H",
     fib_bars: int = 140,
     balance_usd: float = 1184.0,   # <- TU BALANCE
-    risk_pct: float = 0.01         # <- 1% riesgo por trade
+    risk_pct: float = 0.01,        # <- 1% riesgo por trade
+    use_confirmed_candles: bool = USE_CONFIRMED_CANDLES
 ) -> Dict[str, object]:
     tf_results = {}
     tf_dfs = {}
@@ -1240,7 +1317,7 @@ def get_signal(
         if len(df) < 120:
             raise ValueError(f"Datos insuficientes en {tf} ({cfg.interval}). Filas: {len(df)}")
         tf_dfs[tf] = df
-        tf_results[tf] = score_timeframe(df)
+        tf_results[tf] = score_timeframe(df, use_confirmed=use_confirmed_candles)
 
     summary = aggregate_signal(tf_results)
 
@@ -1272,17 +1349,24 @@ def get_signal(
         risk_final["atr_details"] = risk_atr
         risk_final["fib_timeframe"] = fib_tf
 
+    # Guardar entry original (mid) para referencia
+    risk_final["entry_mid"] = entry
+
     final_conf = compute_final_confidence(summary["weighted_score"], summary["agreement"], tf_results)
 
     # Position sizing (lotaje)
     position = None
     if summary["action"] != "HOLD" and risk_final.get("sl") is not None:
+        # Usar entry/SL ajustados por spread para un sizing más realista
+        spread_adj = adjust_sl_tp_for_spread(entry, risk_final["sl"], risk_final["tp"], summary["action"], ticker, buffer_multiplier=1.0)
+        entry_for_pos = spread_adj.get("entry_adjusted", risk_final["entry"])
+        sl_for_pos = spread_adj.get("sl_adjusted", risk_final["sl"])
         position = position_size_lots(
             ticker=ticker,
             balance_usd=balance_usd,
             risk_pct=risk_pct,
-            entry=risk_final["entry"],
-            sl=risk_final["sl"],
+            entry=entry_for_pos,
+            sl=sl_for_pos,
             min_lot=0.01,
             lot_step=0.01
         )
@@ -1608,14 +1692,22 @@ def export_signals_to_csv(results: List[dict], filename: str = None) -> str:
         
         rk = r.get("risk", {})
         pz = r.get("position", {})
+        spread_adj = r.get("spread_adjustment", {})
         
         entry = rk.get("entry", 0)
+        entry_mid = rk.get("entry_mid", entry)
         sl = rk.get("sl", 0)
         tp = rk.get("tp", 0)
+        entry_adj = spread_adj.get("entry_adjusted", entry_mid)
+        sl_adj = spread_adj.get("sl_adjusted", sl)
+        tp_adj = spread_adj.get("tp_adjusted", tp)
         
-        rr_ratio = calculate_rr_ratio(entry, sl, tp)
+        rr_ratio = calculate_rr_ratio(entry_mid, sl, tp)
+        rr_ratio_adj = calculate_rr_ratio(entry_adj, sl_adj, tp_adj)
         lots = pz.get("lots", 0) if pz else 0
         risk_usd = pz.get("risk_usd_actual", 0) if pz else 0
+
+        decimals = 3 if "JPY" in tkr else 5
         
         rows.append({
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1623,10 +1715,15 @@ def export_signals_to_csv(results: List[dict], filename: str = None) -> str:
             "action": action,
             "confidence": round(conf, 2),
             "weighted_score": round(wscore, 2),
-            "entry": round(entry, 5) if entry else "",
-            "stop_loss": round(sl, 5) if sl else "",
-            "take_profit": round(tp, 5) if tp else "",
+            "entry": round(entry_mid, decimals) if entry_mid else "",
+            "stop_loss": round(sl, decimals) if sl else "",
+            "take_profit": round(tp, decimals) if tp else "",
             "rr_ratio": round(rr_ratio, 2),
+            "entry_adj": round(entry_adj, decimals) if entry_adj else "",
+            "stop_loss_adj": round(sl_adj, decimals) if sl_adj else "",
+            "take_profit_adj": round(tp_adj, decimals) if tp_adj else "",
+            "rr_ratio_adj": round(rr_ratio_adj, 2),
+            "spread_pips": round(spread_adj.get("spread_pips", 0), 1),
             "lots": round(lots, 2),
             "risk_usd": round(risk_usd, 2),
             "sl_tag": rk.get("sl_tag", ""),
@@ -1760,29 +1857,44 @@ def scan_market(
                 print(f"🔋 ADR {adr_pct:.0f}% agotado (skip)")
                 continue
             
-            # Calcular y filtrar por R:R
+            # Risk data base
             rk = signal.get("risk", {})
-            pz = signal.get("position", {})
             entry = rk.get("entry", 0)
             sl = rk.get("sl", 0)
             tp = rk.get("tp", 0)
-            lots = pz.get("lots", 0) if pz else 0
-            actual_rr = calculate_rr_ratio(entry, sl, tp)
-            
+
+            # Ajustar Entry/SL/TP por spread (más realista)
+            spread_adj = adjust_sl_tp_for_spread(entry, sl, tp, action, ticker, buffer_multiplier=1.0)
+            signal["spread_adjustment"] = spread_adj
+            entry_adj = spread_adj.get("entry_adjusted", entry)
+            sl_adj = spread_adj.get("sl_adjusted", sl)
+            tp_adj = spread_adj.get("tp_adjusted", tp)
+
+            # Calcular y filtrar por R:R usando valores ajustados
+            actual_rr = calculate_rr_ratio(entry_adj, sl_adj, tp_adj)
             if actual_rr < min_rr:
                 print(f"📉 R:R {actual_rr:.1f} < {min_rr:.1f} (skip)")
                 continue
+
+            # Recalcular posición usando SL ajustado por spread
+            position = None
+            if action != "HOLD" and sl_adj is not None and entry_adj is not None:
+                position = position_size_lots(
+                    ticker=ticker,
+                    balance_usd=balance_usd,
+                    risk_pct=risk_pct,
+                    entry=entry_adj,
+                    sl=sl_adj,
+                    min_lot=0.01,
+                    lot_step=0.01
+                )
+            signal["position"] = position
+            lots = position.get("lots", 0) if position else 0
             
-            # Ajustar SL/TP por spread
-            spread_adj = adjust_sl_tp_for_spread(entry, sl, tp, action, ticker, buffer_multiplier=1.0)
-            signal["spread_adjustment"] = spread_adj
-            
-            # Agregar trailing stop info al signal
+            # Agregar trailing stop y Multi-TP usando niveles ajustados
             if action != "HOLD":
-                signal["trailing_stop"] = calculate_trailing_stop(entry, sl, tp, action)
-                # Agregar Multi-TP (take profits parciales) - usar TP ajustado por spread
-                tp_adj = spread_adj.get("tp_adjusted", tp)
-                signal["multi_tp"] = calculate_multi_tp(entry, sl, tp_adj, action, lots, ticker)
+                signal["trailing_stop"] = calculate_trailing_stop(entry_adj, sl_adj, tp_adj, action)
+                signal["multi_tp"] = calculate_multi_tp(entry_adj, sl_adj, tp_adj, action, lots, ticker)
                 # Detectar zonas de liquidez
                 signal["liquidity"] = detect_liquidity_zones(ticker, timeframe="4h")
             
@@ -1861,9 +1973,10 @@ def build_ranking_summary(results: List[dict], top_n: int = 10) -> str:
         # Risk data
         rk = sig.get("risk", {})
         pz = sig.get("position", {})
-        entry = rk.get("entry", 0)
-        sl = rk.get("sl", 0)
-        tp = rk.get("tp", 0)
+        spread_adj = sig.get("spread_adjustment", {})
+        entry = spread_adj.get("entry_adjusted", rk.get("entry", 0))
+        sl = spread_adj.get("sl_adjusted", rk.get("sl", 0))
+        tp = spread_adj.get("tp_adjusted", rk.get("tp", 0))
         lots = pz.get("lots", 0) if pz else 0
         
         # Emoji
@@ -2000,6 +2113,10 @@ def run_single_scan(
     """
     Ejecuta un escaneo completo del mercado.
     """
+    # Limpiar cache de datos antes de cada escaneo
+    if USE_OHLC_CACHE:
+        clear_ohlc_cache()
+
     # Info de sesión
     print(build_session_info())
     
@@ -2218,6 +2335,7 @@ def build_compact_signal(sig: dict) -> str:
     pz = sig.get("position", {})
     
     entry = rk.get("entry", 0)
+    entry_mid = rk.get("entry_mid", entry)
     sl = rk.get("sl", 0)
     tp = rk.get("tp", 0)
     sl_tag = rk.get("sl_tag", "ATR")
@@ -2227,14 +2345,13 @@ def build_compact_signal(sig: dict) -> str:
     
     # Spread adjustment
     spread_adj = sig.get("spread_adjustment", {})
+    entry_adj = spread_adj.get("entry_adjusted", entry_mid)
     sl_adj = spread_adj.get("sl_adjusted", sl)
     tp_adj = spread_adj.get("tp_adjusted", tp)
     spread_pips = spread_adj.get("spread_pips", 0)
     
-    # R:R (usando valores originales para el cálculo)
-    sl_dist = abs(entry - sl) if entry and sl else 0
-    tp_dist = abs(entry - tp) if entry and tp else 0
-    rr_ratio = tp_dist / sl_dist if sl_dist > 0 else 0
+    # R:R usando valores ajustados
+    rr_ratio = calculate_rr_ratio(entry_adj, sl_adj, tp_adj)
     
     decimals = 3 if "JPY" in tkr else 5
     
@@ -2243,7 +2360,8 @@ def build_compact_signal(sig: dict) -> str:
         f"  {emoji} {tkr} - {action}",
         f"{'─' * 60}",
         f"  Bias: {bias} | Confianza: {conf:.2f}",
-        f"  Entry: {entry:.{decimals}f}",
+        f"  Entry (mid): {entry_mid:.{decimals}f}",
+        f"  Entry (con spread): {entry_adj:.{decimals}f}",
         f"",
         f"  📍 NIVELES ORIGINALES (sin spread):",
         f"     SL: {sl:.{decimals}f} ({sl_tag}) | TP: {tp:.{decimals}f} ({tp_tag})",
